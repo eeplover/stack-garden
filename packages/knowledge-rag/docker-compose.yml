@@ -1,0 +1,22 @@
+version: '3.8'
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: knowledge_rag
+      POSTGRES_USER: dev
+      POSTGRES_PASSWORD: devpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dev -d knowledge_rag"]
+      interval: 5s
+      retries: 5
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+volumes:
+  pgdata:
