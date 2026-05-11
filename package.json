@@ -1,0 +1,18 @@
+{
+  "name": "stack-garden",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "clean": "turbo run clean"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.4",
+    "turbo-linux-64": "^2.8.17",
+    "typescript": "^5.8.3"
+  }
+}
