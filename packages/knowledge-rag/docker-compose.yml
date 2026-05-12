@@ -14,9 +14,37 @@ services:
       test: ["CMD-SHELL", "pg_isready -U dev -d knowledge_rag"]
       interval: 5s
       retries: 5
+
   redis:
     image: redis:alpine
     ports:
       - "6379:6379"
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # 模型拉取只需执行一次，模型文件持久化在 ollama_data volume。
+  # restart: no 确保重新 up 时不重复拉取（ollama pull 本身也是幂等的）。
+  ollama-init:
+    image: ollama/ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["/bin/sh", "-c", "ollama pull nomic-embed-text && ollama pull qwen2:7b"]
+    restart: "no"
+
 volumes:
   pgdata:
+  ollama_data:

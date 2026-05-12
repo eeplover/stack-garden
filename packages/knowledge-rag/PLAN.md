@@ -13,6 +13,7 @@
 | 文档解析 | Apache Tika（Spring AI 集成）| 解析 PDF、Word、txt |
 | 构建工具 | Maven | 后端依赖管理 |
 | 本地环境 | Docker Compose | PostgreSQL + Redis |
+| AI 模型 | Ollama（本地）| 对话用 qwen2:7b，Embedding 用 nomic-embed-text |
 
 ## 架构图
 
@@ -34,7 +35,9 @@ PostgreSQL + pgvector (:5432)
   ├── conversations
   └── messages
   ↕
-OpenAI API (external)
+Ollama (local, :11434)
+  ├── qwen2:7b             ← 对话模型
+  └── nomic-embed-text     ← Embedding 模型（768 维）
 ```
 
 ---
@@ -46,13 +49,22 @@ java -version       # 需要 21
 mvn -version        # 需要 3.9+
 node --version      # 需要 18+
 docker --version    # 需要已启动 Docker Desktop
+ollama --version    # 需要已安装 Ollama（https://ollama.com）
+```
+
+安装 Ollama 模型（首次，约 5GB，下载后可离线使用）：
+
+```bash
+ollama pull nomic-embed-text   # Embedding 模型，768 维，约 274MB
+ollama pull qwen2:7b           # 对话模型，约 4.4GB（也可用 llama3:8b）
+ollama serve                   # 启动服务，监听 :11434，保持终端开着
 ```
 
 ---
 
 ## 第 1 周：AI 应用基础 + 最小聊天界面
 
-**目标：** 跑通 Browser → Next.js → Spring Boot → OpenAI 完整链路，含流式响应。
+**目标：** 跑通 Browser → Next.js → Spring Boot → Ollama 完整链路，含流式响应。
 
 **本周学习：** LLM API 调用、SSE 流式传输、System Prompt、Token、Context Window
 
@@ -163,7 +175,7 @@ psql 'postgresql://dev:devpassword@localhost:5433/knowledge_rag' -c 'select 1;'
 ```xml
 <dependency>
   <groupId>org.springframework.ai</groupId>
-  <artifactId>spring-ai-starter-model-openai</artifactId>
+  <artifactId>spring-ai-starter-model-ollama</artifactId>
 </dependency>
 <dependency>
   <groupId>org.springframework.ai</groupId>
@@ -192,19 +204,19 @@ spring:
       ddl-auto: update
     show-sql: false
   ai:
-    openai:
-      api-key: ${OPENAI_API_KEY}
+    ollama:
+      base-url: http://localhost:11434
       chat:
         options:
-          model: gpt-4o-mini
+          model: qwen2:7b
           temperature: 0.7
       embedding:
         options:
-          model: text-embedding-3-small
+          model: nomic-embed-text
     vectorstore:
       pgvector:
         initialize-schema: true
-        dimensions: 1536
+        dimensions: 768    # nomic-embed-text 输出 768 维向量
 
 server:
   port: 8080
@@ -215,14 +227,16 @@ server:
 ```bash
 cd knowledge-rag/frontend
 npx create-next-app@latest . --typescript --tailwind --app --src-dir --no-git
-npm install ai @ai-sdk/openai
+npm install ai
 ```
 
 **验收：**
 
 ```bash
+# 确保 ollama serve 在运行（另开一个终端执行 ollama serve）
+
 # 后端：在 backend/ 目录
-OPENAI_API_KEY=sk-xxx mvn spring-boot:run
+mvn spring-boot:run
 # 看到 "Started KnowledgeRagApplication" 表示成功
 
 # 前端：在 frontend/ 目录
@@ -247,6 +261,25 @@ public record ChatRequest(String message, String conversationId) {}
 创建 `src/main/java/com/example/knowledgerag/controller/ChatController.java`：
 
 ```java
+package com.example.knowledgerag.controller;
+
+import com.example.knowledgerag.dto.ChatRequest;
+
+import java.util.Map;
+
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
+import org.springframework.ai.chat.memory.InMemoryChatMemory;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+import reactor.core.publisher.Flux;
+
 @RestController
 @RequestMapping("/api/chat")
 @CrossOrigin(origins = "http://localhost:3000")
@@ -303,7 +336,8 @@ public class ChatController {
             .advisors(a -> a.param(
                 // 告诉 MessageChatMemoryAdvisor 用哪个 ID 读写历史记录。
                 // 相同 conversationId 的请求共享历史，不同 ID 互相独立。
-                CHAT_MEMORY_CONVERSATION_ID_KEY,
+                // ChatMemory.CONVERSATION_ID：Spring AI 约定的 advisor 参数名，勿手写魔法字符串。
+                ChatMemory.CONVERSATION_ID,
                 request.conversationId() != null ? request.conversationId() : "default"
             ))
             // .stream() vs .call()：
@@ -805,7 +839,7 @@ curl "localhost:8080/api/debug/embedding?text=Kotlin也是JVM上的语言"
 curl "localhost:8080/api/debug/embedding?text=今天北京天气很好"
 ```
 
-**关键理解：** Embedding 把"语义"映射到高维空间，语义越相近的文本，向量越接近。
+**关键理解：** Embedding 把"语义"映射到高维空间，语义越相近的文本，向量越接近。nomic-embed-text 返回 768 维向量，调用三次观察 `dimensions` 字段均为 768。
 
 ---
 
@@ -884,19 +918,18 @@ private void chunkAndEmbed(String documentId,
      *
      * 步骤 1：Embedding（向量化）
      *   → 对每个 chunk 调用 EmbeddingModel.embed(chunk.content)
-     *   → 发起 OpenAI text-embedding-3-small API 请求（会产生计费！）
-     *   → 把 512 token 的文本转换为 1536 维的浮点数向量
+     *   → 调用本地 Ollama nomic-embed-text 模型（完全免费，无网络请求）
+     *   → 把文本转换为 768 维的浮点数向量
      *
      * 步骤 2：持久化
      *   → 把向量、chunk 内容、metadata 一起存入 pgvector 的 vector_store 表
-     *   → 表结构：id | content (text) | metadata (jsonb) | embedding (vector(1536))
+     *   → 表结构：id | content (text) | metadata (jsonb) | embedding (vector(768))
      *
      * 步骤 3：建索引（首次或按需）
      *   → pgvector 在 embedding 列上维护 IVFFlat/HNSW 索引
      *   → 使得后续的相似性搜索在百万级数据下仍能毫秒级返回
      *
-     * 成本估算：text-embedding-3-small 约 $0.02 / 1M tokens
-     * 100 个文档 × 100 chunks × 512 tokens ≈ 5M tokens ≈ $0.10
+     * 成本：本地模型，零 API 费用。速度取决于机器 CPU/GPU，首次调用较慢，后续会缓存。
      */
     vectorStore.add(chunks);
 
@@ -1148,7 +1181,7 @@ public List<RetrievedChunk> hybridSearch(String question, int topK) {
      * │              │ 向量搜索                        │ 关键词搜索                   │
      * ├──────────────┼────────────────────────────────┼─────────────────────────────┤
      * │ 优势         │ 理解语义                        │ 精确匹配                     │
-     * │              │ "汽车" 能匹配 "轿车"            │ "GPT-4o-mini" 一定能找到     │
+     * │              │ "汽车" 能匹配 "轿车"            │ "qwen2:7b" 一定能找到        │
      * ├──────────────┼────────────────────────────────┼─────────────────────────────┤
      * │ 弱点         │ 专有名词、型号、代号效果差       │ 同义词、近义词完全找不到      │
      * └──────────────┴────────────────────────────────┴─────────────────────────────┘
@@ -1361,7 +1394,7 @@ SearchRequest.query(question)
 
 ## 第 6 周：生产化能力
 
-**目标：** 权限过滤、成本控制、评估集、延迟优化
+**目标：** 权限过滤、性能优化、评估集、延迟优化
 
 ---
 
@@ -1389,17 +1422,17 @@ builder = builder.withFilterExpression("owner_id == '" + userId + "'");
 
 ---
 
-### Day 2：Embedding 成本控制
+### Day 2：Embedding 性能优化
 
 ```java
-// content hash 缓存，跳过重复 embedding
+// content hash 缓存，跳过重复 embedding（Ollama 本地推理也有耗时，值得缓存）
 String hash = DigestUtils.sha256Hex(content);
 if (chunkRepository.existsByContentHash(hash)) {
     log.info("Skipping duplicate chunk: {}", hash);
     return;
 }
 
-// 批量 embedding 减少 API 调用次数（N 次 → 1 次）
+// 批量 embedding 减少模型调用次数（N 次串行 → 1 次批量，对 Ollama 效果尤其明显）
 List<float[]> vectors = embeddingModel.embed(List.of(text1, text2, text3));
 ```
 
@@ -1440,7 +1473,7 @@ public void deleteDocument(String id) { ... }
 -- m (16)：图中每个节点的最大边数。越大精度越高，但内存占用和建索引时间增加。推荐 16。
 -- ef_construction (64)：建索引时每个节点的候选邻居数。越大质量越好，建索引越慢。推荐 64。
 --
--- vector_cosine_ops：使用余弦距离。OpenAI embedding 是单位向量，余弦距离是语义搜索领域的惯例。
+-- vector_cosine_ops：使用余弦距离。nomic-embed-text 输出归一化向量，余弦距离是语义搜索领域的惯例。
 DROP INDEX IF EXISTS vector_store_embedding_idx;
 CREATE INDEX ON vector_store
   USING hnsw (embedding vector_cosine_ops)
