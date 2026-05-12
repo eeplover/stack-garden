@@ -4,8 +4,8 @@
 
 | 层 | 选型 | 说明 |
 |---|---|---|
-| 前端 | Next.js 14 + TypeScript | App Router |
-| AI UI | Vercel AI SDK | useChat 流式展示 |
+| 前端 | Next.js 16 + TypeScript | App Router（本仓库位于 monorepo `pnpm-workspace`，`frontend` 为独立 workspace 包） |
+| AI UI | Vercel AI SDK 6（`ai`）+ `@ai-sdk/react` | `useChat` + `DefaultChatTransport`，服务端用 `createUIMessageStream` 适配 Spring SSE |
 | 后端 | Java 21 + Spring Boot 3.3 | REST + SSE |
 | AI 框架 | Spring AI 1.0 | ChatClient、EmbeddingModel、VectorStore |
 | 向量数据库 | PostgreSQL 16 + pgvector | Postgres 内做向量搜索 |
@@ -225,10 +225,12 @@ server:
 **7. 创建 Next.js 前端**
 
 ```bash
-cd knowledge-rag/frontend
+cd packages/knowledge-rag/frontend   # 或你的 knowledge-rag/frontend 路径
 npx create-next-app@latest . --typescript --tailwind --app --src-dir --no-git
-npm install ai
+pnpm add ai @ai-sdk/react          # AI SDK 6：React 钩子已迁至 @ai-sdk/react，不再使用 ai/react
 ```
+
+如在仓库根目录（stack-garden）统一管理依赖，需把 `packages/knowledge-rag/frontend` 写入根目录 `pnpm-workspace.yaml`，再在仓库根执行 `pnpm install`。
 
 **验收：**
 
@@ -239,8 +241,7 @@ npm install ai
 mvn spring-boot:run
 # 看到 "Started KnowledgeRagApplication" 表示成功
 
-# 前端：在 frontend/ 目录
-npm run dev
+# 前端：pnpm run dev（在 frontend/）
 # 浏览器访问 http://localhost:3000
 ```
 
@@ -364,114 +365,197 @@ curl -X POST http://localhost:8080/api/chat \
 
 ### Day 3：前端实现流式聊天 UI
 
-**学习重点：** Next.js App Router API Route、Vercel AI SDK useChat、SSE 流透传
+**学习重点：** Next.js App Router API Route、`@ai-sdk/react` 的 `useChat`、`DefaultChatTransport`、服务端 `createUIMessageStream` 将 Spring SSE 转为 UI Message Stream；**解析上游 SSE 时须兼容 `data:正文`（冒号后无空格），勿误写成仅匹配 `data: `**
 
 创建 `frontend/src/app/api/chat/route.ts`：
 
 ```typescript
-import { createDataStreamResponse } from 'ai';
+import { createUIMessageStream, createUIMessageStreamResponse } from 'ai';
 
 /**
- * 这个 Next.js API Route 是"SSE 格式适配层"。
+ * 这个 Next.js API Route 是"SSE → UI Message Stream" 适配层。
  *
- * 问题背景：两个系统的 SSE 格式不一样：
+ * Spring Boot（Spring AI）输出的是**纯文本 token** 的 SSE，常见两种写法：
+ *   data:你\n\n      ← Spring MVC 对 Flux 常无空格
+ *   data: 你\n\n     ← 部分示例带空格
  *
- * Spring AI 输出（原始 SSE 文本）：
- *   data: 你\n\n
- *   data: 好\n\n
- *   data: [DONE]\n\n
+ * AI SDK 6 里 DefaultChatTransport 期望响应体是 **JSON 事件的 SSE**（每条 data: 一行 JSON），
+ * 对应内部的 UIMessageChunk（text-start / text-delta / …）。
  *
- * Vercel AI SDK useChat 期望的格式（AI Data Stream Protocol）：
- *   0:"你"\n
- *   0:"好"\n
- *   d:{...}\n         ← 结束标记，含 usage 信息
+ * 旧版示例里的 createDataStreamResponse / writeTextDelta 在 ai@6 中已移除；
+ * 请使用 createUIMessageStream + createUIMessageStreamResponse，用 writer.write() 发出 chunk。
  *
- * createDataStreamResponse + dataStream.writeTextDelta() 负责做这个转换，
- * 使 useChat 钩子可以正常解析流并更新 messages 状态。
+ * Spring MVC 写出 Flux SSE 时，常见 **`data:token`**（`data:` 后无空格）。代理层若只判断 **`data: `**（带空格），会导致所有 **text-delta** 丢失，界面只见空气泡。
+ * （若你只要裸文本流、不用 useChat 的 JSON 协议，可用 createTextStreamResponse + TextStreamChatTransport。）
  */
+function ssePayloadFromLine(line: string): string | null {
+  const trimmed = line.trimEnd();
+  if (!trimmed.startsWith('data:')) return null;
+  let value = trimmed.slice('data:'.length);
+  if (value.startsWith(' ')) value = value.slice(1);
+  value = value.trim();
+  if (!value || value === '[DONE]') return null;
+  return value;
+}
+
+function textFromUiMessage(message: {
+  parts?: Array<{ type: string; text?: string }>;
+  content?: string;
+}) {
+  if (message && typeof message.content === 'string') return message.content;
+  if (!message?.parts?.length) return '';
+  return message.parts
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .map((p) => p.text)
+    .join('');
+}
+
 export async function POST(req: Request) {
   const { messages } = await req.json();
 
   // useChat 把完整消息历史传来，我们只取最后一条发给 Spring Boot。
   // 对话历史由后端 MessageChatMemoryAdvisor 管理，前端无需传递全部历史。
   const lastMessage = messages[messages.length - 1];
+  const userText = textFromUiMessage(lastMessage);
 
-  return createDataStreamResponse({
-    execute: async (dataStream) => {
+  const stream = createUIMessageStream({
+    execute: async ({ writer }) => {
+      const textId = 'assistant-text';
+
+      writer.write({ type: 'start' });
+      writer.write({ type: 'start-step' });
+      writer.write({ type: 'text-start', id: textId });
+
       const response = await fetch('http://localhost:8080/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: lastMessage.content }),
+        body: JSON.stringify({ message: userText }),
       });
 
-      const reader = response.body!.getReader();
-      // TextDecoder 把网络传输的二进制 Uint8Array 解码为 UTF-8 字符串。
+      if (!response.ok || !response.body) {
+        writer.write({
+          type: 'error',
+          errorText: `Spring upstream failed: ${response.status}`,
+        });
+        writer.write({ type: 'text-end', id: textId });
+        writer.write({ type: 'finish-step' });
+        writer.write({ type: 'finish', finishReason: 'error' });
+        return;
+      }
+
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let sseBuffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const text = decoder.decode(value);
+        sseBuffer += decoder.decode(value, { stream: true });
 
-        // 注意：一次 read() 可能包含多个 SSE 事件（网络分包合并），
-        // 必须按行分割逐条处理，不能假设每次 read() 只有一个事件。
-        for (const line of text.split('\n')) {
-          if (line.startsWith('data: ')) {
-            const token = line.slice(6).trim(); // 去掉 "data: " 前缀
-            // [DONE] 是 OpenAI 协议的流结束标记，Spring AI 遵循同样的约定。
-            if (token && token !== '[DONE]') {
-              // writeTextDelta 把纯文本 token 转成 Vercel AI SDK 的数据流格式，
-              // useChat 内部会把所有 delta 拼成完整的 assistant 消息内容。
-              dataStream.writeTextDelta(token);
-            }
+        let newlineIndex: number;
+        while ((newlineIndex = sseBuffer.indexOf('\n')) >= 0) {
+          const line = sseBuffer.slice(0, newlineIndex).trimEnd();
+          sseBuffer = sseBuffer.slice(newlineIndex + 1);
+
+          const token = ssePayloadFromLine(line);
+          if (token) {
+            writer.write({ type: 'text-delta', id: textId, delta: token });
           }
         }
       }
+
+      sseBuffer += decoder.decode();
+      if (sseBuffer.trim()) {
+        for (const line of sseBuffer.split('\n')) {
+          const trimmed = line.trimEnd();
+          const token = ssePayloadFromLine(trimmed);
+          if (token) {
+            writer.write({ type: 'text-delta', id: textId, delta: token });
+          }
+        }
+      }
+
+      writer.write({ type: 'text-end', id: textId });
+      writer.write({ type: 'finish-step' });
+      writer.write({ type: 'finish', finishReason: 'stop' });
     },
   });
+
+  return createUIMessageStreamResponse({ stream });
 }
 ```
 
-创建 `frontend/src/app/page.tsx`：
+创建 `frontend/src/app/page.tsx`（本仓库聊天 UI 在首页 **`/`**，API Route 仍为 `frontend/src/app/api/chat/route.ts` → **`/api/chat`**）：
 
 ```typescript
 'use client';
-import { useChat } from 'ai/react';
+
+import { useChat } from '@ai-sdk/react';
+import { DefaultChatTransport, type UIMessage } from 'ai';
+import { type FormEvent, useState } from 'react';
+
+function textFromMessage(message: UIMessage) {
+  return message.parts
+    .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+    .map((p) => p.text)
+    .join('');
+}
 
 export default function ChatPage() {
-  const { messages, input, handleInputChange, handleSubmit, isLoading } = useChat();
+  const [input, setInput] = useState('');
+  const { messages, sendMessage, status } = useChat({
+    transport: new DefaultChatTransport({ api: '/api/chat' }),
+  });
+
+  const busy = status === 'submitted' || status === 'streaming';
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const text = input.trim();
+    if (!text || busy) return;
+    setInput('');
+    await sendMessage({ text });
+  }
 
   return (
     <main className="flex flex-col max-w-2xl mx-auto h-screen p-4">
       <h1 className="text-2xl font-bold mb-4">知识库助手</h1>
 
       <div className="flex-1 overflow-y-auto space-y-3 mb-4">
-        {messages.map(m => (
-          <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-            <div className={`max-w-lg p-3 rounded-lg ${
-              m.role === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-800'
-            }`}>
-              {m.content}
+        {messages.map((m) => (
+          <div
+            key={m.id}
+            className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}
+          >
+            <div
+              className={`max-w-lg p-3 rounded-lg ${
+                m.role === 'user' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-800'
+              }`}
+            >
+              {textFromMessage(m)}
             </div>
           </div>
         ))}
-        {isLoading && (
+        {busy && (
           <div className="flex justify-start">
             <div className="bg-gray-100 p-3 rounded-lg text-gray-400">思考中...</div>
           </div>
         )}
       </div>
 
-      <form onSubmit={handleSubmit} className="flex gap-2">
+      <form onSubmit={onSubmit} className="flex gap-2">
         <input
           value={input}
-          onChange={handleInputChange}
+          onChange={(e) => setInput(e.target.value)}
           placeholder="输入你的问题..."
           className="flex-1 border border-gray-300 rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
-        <button type="submit" disabled={isLoading || !input.trim()}
-          className="bg-blue-500 text-white px-6 py-3 rounded-lg disabled:opacity-50">
+        <button
+          type="submit"
+          disabled={busy || !input.trim()}
+          className="bg-blue-500 text-white px-6 py-3 rounded-lg disabled:opacity-50"
+        >
           发送
         </button>
       </form>
@@ -481,7 +565,7 @@ export default function ChatPage() {
 ```
 
 **验收：**
-- [ ] 浏览器打开 http://localhost:3000
+- [ ] 浏览器打开 `http://localhost:3000`（聊天 UI）；Network 中 **`/api/chat`** 的 SSE 在 `text-start` 与 `text-end` 之间应出现多条 **`text-delta`**
 - [ ] 输入消息，AI 回复逐字流式出现
 - [ ] 控制台无 CORS 或格式错误
 
