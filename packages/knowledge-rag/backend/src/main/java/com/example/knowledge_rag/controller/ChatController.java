@@ -4,10 +4,14 @@ import com.example.knowledge_rag.dto.ChatRequest;
 
 import java.util.Map;
 
+import lombok.extern.slf4j.Slf4j;
+
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.chat.metadata.Usage;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -17,6 +21,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import reactor.core.publisher.Flux;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/chat")
 @CrossOrigin(origins = "http://localhost:3000")
@@ -50,15 +55,23 @@ public class ChatController {
     // 非流式接口，调试用。等 LLM 生成完整响应后一次性返回。
     @PostMapping
     public Map<String, String> chat(@RequestBody ChatRequest request) {
-        String response = chatClient.prompt()
+        ChatResponse chatResponse = chatClient.prompt()
             .user(request.message())
             .advisors(a -> a.param(
                 ChatMemory.CONVERSATION_ID,
                 request.conversationId() != null ? request.conversationId() : ChatMemory.DEFAULT_CONVERSATION_ID
             ))
             .call()
-            .content();
-        return Map.of("content", response);
+            .chatResponse();
+
+        Usage usage = chatResponse.getMetadata().getUsage();
+        if (usage != null) {
+            log.info("Tokens used: prompt={}, completion={}, total={}",
+                usage.getPromptTokens(), usage.getCompletionTokens(), usage.getTotalTokens());
+        }
+
+        String content = chatResponse.getResult().getOutput().getText();
+        return Map.of("content", content);
     }
 
     /**

@@ -191,6 +191,8 @@ psql 'postgresql://dev:devpassword@localhost:5433/knowledge_rag' -c 'select 1;'
 
 将 `application.properties` 重命名为 `application.yml`：
 
+📄 `backend/src/main/resources/application.yml`
+
 ```yaml
 spring:
   application:
@@ -206,6 +208,8 @@ spring:
   ai:
     ollama:
       base-url: http://localhost:11434
+      init:
+        pull-model-strategy: when_missing   # 启动时若本地无此模型则自动拉取
       chat:
         options:
           model: qwen2:7b
@@ -251,27 +255,31 @@ mvn spring-boot:run
 
 **学习重点：** Spring Boot Controller、Spring AI ChatClient、CORS 配置
 
-创建 `src/main/java/com/example/knowledgerag/dto/ChatRequest.java`：
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/ChatRequest.java`
 
 ```java
-package com.example.knowledgerag.dto;
+package com.example.knowledge_rag.dto;
 
 public record ChatRequest(String message, String conversationId) {}
 ```
 
-创建 `src/main/java/com/example/knowledgerag/controller/ChatController.java`：
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/ChatController.java`
 
 ```java
-package com.example.knowledgerag.controller;
+package com.example.knowledge_rag.controller;
 
-import com.example.knowledgerag.dto.ChatRequest;
+import com.example.knowledge_rag.dto.ChatRequest;
 
 import java.util.Map;
+
+import lombok.extern.slf4j.Slf4j;
 
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.memory.InMemoryChatMemory;
+import org.springframework.ai.chat.memory.MessageWindowChatMemory;
+import org.springframework.ai.chat.metadata.Usage;
+import org.springframework.ai.chat.model.ChatResponse;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -281,6 +289,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import reactor.core.publisher.Flux;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/chat")
 @CrossOrigin(origins = "http://localhost:3000")
@@ -303,19 +312,35 @@ public class ChatController {
             .defaultSystem("你是一个有帮助的 AI 助手，用中文回复。")
             // Advisor 是 Spring AI 的拦截器机制，可在请求发出前后插入逻辑。
             // MessageChatMemoryAdvisor：每次调用时自动把历史消息注入 prompt，实现多轮对话。
-            // InMemoryChatMemory：历史存内存，重启后丢失。生产环境要换成 Redis 或数据库实现。
-            .defaultAdvisors(new MessageChatMemoryAdvisor(new InMemoryChatMemory()))
+            // MessageWindowChatMemory：内存中的滑动窗口历史，重启后丢失。生产可换 Redis/DB 实现。
+            // Spring AI 1.0 要求 advisor 构建时必须指定非空的默认会话 ID。
+            .defaultAdvisors(MessageChatMemoryAdvisor.builder(MessageWindowChatMemory.builder().build())
+                .conversationId(ChatMemory.DEFAULT_CONVERSATION_ID)
+                .build())
             .build();
     }
 
     // 非流式接口，调试用。等 LLM 生成完整响应后一次性返回。
     @PostMapping
     public Map<String, String> chat(@RequestBody ChatRequest request) {
-        String response = chatClient.prompt()
+        ChatResponse chatResponse = chatClient.prompt()
             .user(request.message())
+            .advisors(a -> a.param(
+                ChatMemory.CONVERSATION_ID,
+                request.conversationId() != null ? request.conversationId() : ChatMemory.DEFAULT_CONVERSATION_ID
+            ))
             .call()
-            .content();
-        return Map.of("content", response);
+            .chatResponse();
+
+        // Token 用量监控：本地 Ollama 不计费，但养成习惯，上云后直接有数据。
+        Usage usage = chatResponse.getMetadata().getUsage();
+        if (usage != null) {
+            log.info("Tokens used: prompt={}, completion={}, total={}",
+                usage.getPromptTokens(), usage.getCompletionTokens(), usage.getTotalTokens());
+        }
+
+        String content = chatResponse.getResult().getOutput().getText();
+        return Map.of("content", content);
     }
 
     /**
@@ -339,7 +364,7 @@ public class ChatController {
                 // 相同 conversationId 的请求共享历史，不同 ID 互相独立。
                 // ChatMemory.CONVERSATION_ID：Spring AI 约定的 advisor 参数名，勿手写魔法字符串。
                 ChatMemory.CONVERSATION_ID,
-                request.conversationId() != null ? request.conversationId() : "default"
+                request.conversationId() != null ? request.conversationId() : ChatMemory.DEFAULT_CONVERSATION_ID
             ))
             // .stream() vs .call()：
             // .stream()：LLM 每生成一个 token 立即发送，用户看到"打字机"效果。
@@ -367,7 +392,7 @@ curl -X POST http://localhost:8080/api/chat \
 
 **学习重点：** Next.js App Router API Route、`@ai-sdk/react` 的 `useChat`、`DefaultChatTransport`、服务端 `createUIMessageStream` 将 Spring SSE 转为 UI Message Stream；**解析上游 SSE 时须兼容 `data:正文`（冒号后无空格），勿误写成仅匹配 `data: `**
 
-创建 `frontend/src/app/api/chat/route.ts`：
+📄 `frontend/src/app/api/chat/route.ts`
 
 ```typescript
 import { createUIMessageStream, createUIMessageStreamResponse } from 'ai';
@@ -486,7 +511,7 @@ export async function POST(req: Request) {
 }
 ```
 
-创建 `frontend/src/app/page.tsx`（本仓库聊天 UI 在首页 **`/`**，API Route 仍为 `frontend/src/app/api/chat/route.ts` → **`/api/chat`**）：
+📄 `frontend/src/app/page.tsx`（聊天 UI 在首页 `/`，API Route 路径 → `/api/chat`）
 
 ```typescript
 'use client';
@@ -603,7 +628,7 @@ ChatResponse response = chatClient.prompt()
 
 Usage usage = response.getMetadata().getUsage();
 log.info("Tokens used: prompt={}, completion={}, total={}",
-    usage.getPromptTokens(), usage.getGenerationTokens(), usage.getTotalTokens());
+    usage.getPromptTokens(), usage.getCompletionTokens(), usage.getTotalTokens());
 ```
 
 ---
@@ -629,7 +654,19 @@ log.info("Tokens used: prompt={}, completion={}, total={}",
 
 **1. 创建 Document 实体**
 
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/Document.java`
+
 ```java
+package com.example.knowledge_rag.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+import org.hibernate.annotations.UpdateTimestamp;
+
+import java.time.LocalDateTime;
+
 @Entity           // 声明这是 JPA 管理的实体，对应数据库里的一张表
 @Table(name = "documents") // 显式指定表名，不写则默认用类名小写。推荐显式写明。
 @Data             // Lombok：自动生成 getter / setter / toString / equals / hashCode
@@ -682,13 +719,28 @@ public class Document {
 }
 ```
 
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/DocumentStatus.java`
+
 ```java
+package com.example.knowledge_rag.entity;
+
 public enum DocumentStatus { PENDING, PROCESSING, COMPLETED, FAILED }
 ```
 
 **2. 创建 Repository**
 
+📄 `backend/src/main/java/com/example/knowledge_rag/repository/DocumentRepository.java`
+
 ```java
+package com.example.knowledge_rag.repository;
+
+import com.example.knowledge_rag.entity.Document;
+import com.example.knowledge_rag.entity.DocumentStatus;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
 @Repository
 public interface DocumentRepository extends JpaRepository<Document, String> {
     List<Document> findAllByOrderByCreatedAtDesc();
@@ -698,7 +750,13 @@ public interface DocumentRepository extends JpaRepository<Document, String> {
 
 **3. 创建 DTO（不要直接返回 Entity）**
 
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/DocumentResponse.java`
+
 ```java
+package com.example.knowledge_rag.dto;
+
+import com.example.knowledge_rag.entity.Document;
+
 public record DocumentResponse(
     String id,
     String originalFilename,
@@ -724,7 +782,9 @@ public record DocumentResponse(
 
 ### Day 3-4：文件上传 API
 
-**`application.yml` 补充：**
+**`application.yml` 补充（追加到现有配置末尾）：**
+
+📄 `backend/src/main/resources/application.yml`（追加）
 
 ```yaml
 spring:
@@ -740,7 +800,24 @@ app:
 
 **FileStorageService：**
 
+📄 `backend/src/main/java/com/example/knowledge_rag/service/FileStorageService.java`
+
 ```java
+package com.example.knowledge_rag.service;
+
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Objects;
+import java.util.UUID;
+
 @Service
 @Slf4j
 public class FileStorageService {
@@ -775,7 +852,21 @@ public class FileStorageService {
 
 **DocumentService：**
 
+📄 `backend/src/main/java/com/example/knowledge_rag/service/DocumentService.java`
+
 ```java
+package com.example.knowledge_rag.service;
+
+import com.example.knowledge_rag.dto.DocumentResponse;
+import com.example.knowledge_rag.entity.Document;
+import com.example.knowledge_rag.repository.DocumentRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
+import java.util.Set;
+
 @Service
 @RequiredArgsConstructor
 public class DocumentService {
@@ -813,13 +904,58 @@ public class DocumentService {
 
 **学习重点：** @Async 异步执行、文档状态机、Apache Tika 解析原理
 
-在主类加 `@EnableAsync`，然后：
+在主类加 `@EnableAsync`：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/KnowledgeRagApplication.java`
 
 ```java
+package com.example.knowledge_rag;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableAsync;
+
+@SpringBootApplication
+@EnableAsync   // 启用 @Async 支持，必须加在主类或 @Configuration 类上
+public class KnowledgeRagApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(KnowledgeRagApplication.class, args);
+    }
+}
+```
+
+📄 `backend/src/main/java/com/example/knowledge_rag/service/DocumentProcessingService.java`
+
+```java
+package com.example.knowledge_rag.service;
+
+import com.example.knowledge_rag.entity.Document;
+import com.example.knowledge_rag.entity.DocumentChunk;
+import com.example.knowledge_rag.entity.DocumentStatus;
+import com.example.knowledge_rag.repository.DocumentChunkRepository;
+import com.example.knowledge_rag.repository.DocumentRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.document.DocumentReader;
+import org.springframework.ai.reader.tika.TikaDocumentReader;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.core.io.FileSystemResource;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.nio.file.Path;
+import java.util.List;
+
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class DocumentProcessingService {
+
+    private final DocumentRepository documentRepository;
+    private final DocumentChunkRepository chunkRepository;
+    private final FileStorageService fileStorageService;
+    private final VectorStore vectorStore;
 
     /**
      * @Async 的作用：
@@ -879,7 +1015,7 @@ public class DocumentProcessingService {
 
 ### Day 6-7：前端文档管理页
 
-创建 `frontend/src/app/documents/page.tsx`，实现：
+📄 `frontend/src/app/documents/page.tsx`，实现：
 - 拖拽或点击上传区域
 - 文档列表，含状态徽章（待处理 / 处理中 / 已完成 / 失败）
 - 每 3 秒轮询更新状态（`setInterval` + fetch）
@@ -902,17 +1038,39 @@ public class DocumentProcessingService {
 
 ### Day 1：理解 Embedding（先做实验再编码）
 
+以下调试端点加在 `ChatController` 或新建 `DebugController` 里均可：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/DebugController.java`（新建）
+
 ```java
-@GetMapping("/debug/embedding")
-public Map<String, Object> testEmbedding(
-        @RequestParam String text,
-        @Autowired EmbeddingModel embeddingModel) {
-    float[] vector = embeddingModel.embed(text);
-    return Map.of(
-        "text", text,
-        "dimensions", vector.length,
-        "first5", Arrays.copyOf(vector, 5)
-    );
+package com.example.knowledge_rag.controller;
+
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Arrays;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/debug")
+@CrossOrigin(origins = "http://localhost:3000")
+public class DebugController {
+
+    private final EmbeddingModel embeddingModel;
+
+    public DebugController(EmbeddingModel embeddingModel) {
+        this.embeddingModel = embeddingModel;
+    }
+
+    @GetMapping("/embedding")
+    public Map<String, Object> testEmbedding(@RequestParam String text) {
+        float[] vector = embeddingModel.embed(text);
+        return Map.of(
+            "text", text,
+            "dimensions", vector.length,
+            "first5", Arrays.copyOf(vector, 5)
+        );
+    }
 }
 ```
 
@@ -929,9 +1087,18 @@ curl "localhost:8080/api/debug/embedding?text=今天北京天气很好"
 
 ### Day 2：实现 Chunking
 
-创建 `entity/DocumentChunk.java`：
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/DocumentChunk.java`
 
 ```java
+package com.example.knowledge_rag.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+
 @Entity
 @Table(name = "document_chunks")
 @Data
@@ -955,6 +1122,25 @@ public class DocumentChunk {
     @CreationTimestamp
     @Column(name = "created_at", updatable = false)
     private LocalDateTime createdAt;
+}
+```
+
+📄 `backend/src/main/java/com/example/knowledge_rag/repository/DocumentChunkRepository.java`
+
+```java
+package com.example.knowledge_rag.repository;
+
+import com.example.knowledge_rag.entity.DocumentChunk;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface DocumentChunkRepository extends JpaRepository<DocumentChunk, String> {
+    List<DocumentChunk> findByDocumentIdOrderByChunkIndex(String documentId);
+    boolean existsByContentHash(String contentHash);
+    void deleteByDocumentId(String documentId);
 }
 ```
 
@@ -1041,9 +1227,39 @@ docker exec -it knowledge-rag-postgres-1 psql -U dev -d knowledge_rag \
 
 ### Day 3：实现 RAG 检索
 
-创建 `service/RagService.java`：
+先创建 `RetrievedChunk` 数据传输对象，它贯穿检索、展示、评估全链路：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/RetrievedChunk.java`
 
 ```java
+package com.example.knowledge_rag.dto;
+
+public record RetrievedChunk(
+    String id,
+    String content,
+    String documentId,
+    double score   // 余弦距离：越小越相似（0 = 完全相同，2 = 完全相反）
+) {}
+```
+
+📄 `backend/src/main/java/com/example/knowledge_rag/service/RagService.java`
+
+```java
+package com.example.knowledge_rag.service;
+
+import com.example.knowledge_rag.dto.RetrievedChunk;
+import com.example.knowledge_rag.repository.DocumentChunkRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.vectorstore.SearchRequest;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
 @Service
 @Slf4j
 @RequiredArgsConstructor
@@ -1051,6 +1267,7 @@ public class RagService {
 
     private final ChatClient chatClient;
     private final VectorStore vectorStore;
+    private final DocumentChunkRepository chunkRepository;
 
     /**
      * RAG（Retrieval-Augmented Generation）的核心思路：
@@ -1150,22 +1367,53 @@ public class RagService {
 
 ### Day 4：引用来源展示
 
-**后端：先返回 sources（同步），再流式返回回答**
+先创建请求 DTO：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/RagRequest.java`
 
 ```java
-// 检索 sources
-@PostMapping("/rag/sources")
-public List<RetrievedChunk> getSources(@RequestBody RagRequest request) {
-    return ragService.search(request.question(), 5, request.documentId());
-}
+package com.example.knowledge_rag.dto;
 
-// RAG 流式回答，加相似度阈值守卫
-@PostMapping(value = "/rag/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-public Flux<String> ragStream(@RequestBody RagRequest request) {
-    var chunks = ragService.search(request.question(), 5, request.documentId());
+public record RagRequest(
+    String question,
+    String documentId,    // 可选，null 表示搜全库
+    String conversationId // 可选，用于多轮 RAG 对话
+) {}
+```
+
+**后端：先返回 sources（同步），再流式返回回答**
+
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/RagController.java`
+
+```java
+package com.example.knowledge_rag.controller;
+
+import com.example.knowledge_rag.dto.RagRequest;
+import com.example.knowledge_rag.dto.RetrievedChunk;
+import com.example.knowledge_rag.service.RagService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.*;
+import reactor.core.publisher.Flux;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api")
+@CrossOrigin(origins = "http://localhost:3000")
+@RequiredArgsConstructor
+public class RagController {
+
+    private final RagService ragService;
+    private final ChatClient chatClient;
+
+    @PostMapping("/rag/sources")
+    public List<RetrievedChunk> getSources(@RequestBody RagRequest request) {
+        return ragService.search(request.question(), 5, request.documentId());
+    }
 
     /**
-     * 相似度阈值（Similarity Threshold）：知识库 RAG 最重要的安全阀。
+     * RAG 流式回答，加相似度阈值守卫。
      *
      * pgvector 返回的 distance 是余弦距离（0 到 2，越小越相似）：
      * < 0.35  → 足够相关，可以用来回答
@@ -1173,22 +1421,26 @@ public Flux<String> ragStream(@RequestBody RagRequest request) {
      *
      * 阈值不靠感觉猜，通过评估集数据来确定。
      */
-    boolean hasRelevantChunks = chunks.stream().anyMatch(c -> c.score() < 0.35);
+    @PostMapping(value = "/rag/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public Flux<String> ragStream(@RequestBody RagRequest request) {
+        var chunks = ragService.search(request.question(), 5, request.documentId());
 
-    if (!hasRelevantChunks) {
-        return Flux.just("根据现有文档，我没有找到与该问题相关的内容。");
+        boolean hasRelevantChunks = chunks.stream().anyMatch(c -> c.score() < 0.35);
+        if (!hasRelevantChunks) {
+            return Flux.just("根据现有文档，我没有找到与该问题相关的内容。");
+        }
+
+        String context = ragService.buildContext(chunks);
+        return chatClient.prompt()
+            .system(ragService.buildRagSystemPrompt(context))
+            .user(request.question())
+            .stream()
+            .content();
     }
-
-    String context = ragService.buildContext(chunks);
-    return chatClient.prompt()
-        .system(ragService.buildRagSystemPrompt(context))
-        .user(request.question())
-        .stream()
-        .content();
 }
 ```
 
-**前端 RAG 页面：** 先展示 sources，再流式展示回答（见第 3 周 Day 4 完整代码）。
+📄 `frontend/src/app/rag/page.tsx` — 先展示 sources，再流式展示回答（调用 `/api/rag/sources` 后调 `/api/rag/stream`，参考 `page.tsx` 的 `sendMessage` 模式实现）。
 
 ---
 
@@ -1212,7 +1464,21 @@ public Flux<String> ragStream(@RequestBody RagRequest request) {
 
 ### Day 1：Chunk Size 实验接口
 
+加到 `DebugController`（`/api/debug/preview-chunking`）。`PreviewChunkRequest` 是内联 record：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/DebugController.java`（追加方法）
+
 ```java
+// 新增 import
+import com.example.knowledge_rag.dto.RetrievalDebugResult;
+import org.springframework.ai.transformer.splitter.TokenTextSplitter;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.stream.Collectors;
+import java.util.List;
+
+record PreviewChunkRequest(String text) {}
+
 @PostMapping("/debug/preview-chunking")
 public Map<String, Object> previewChunking(@RequestBody PreviewChunkRequest req) {
     record Config(int size, int overlap) {}
@@ -1243,7 +1509,13 @@ public Map<String, Object> previewChunking(@RequestBody PreviewChunkRequest req)
 
 给 `DocumentChunkRepository` 加全文搜索：
 
+📄 `backend/src/main/java/com/example/knowledge_rag/repository/DocumentChunkRepository.java`（追加方法）
+
 ```java
+// 新增 import
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
 @Query(value = """
     SELECT * FROM document_chunks
     WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', :query)
@@ -1312,7 +1584,35 @@ public List<RetrievedChunk> hybridSearch(String question, int topK) {
 
 ### Day 4-5：检索调试面板
 
-后端调试接口：
+先创建两个 DTO：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/RetrievalDebugResult.java`
+
+```java
+package com.example.knowledge_rag.dto;
+
+import java.util.List;
+
+public record RetrievalDebugResult(
+    String originalQuestion,
+    String rewrittenQuestion,
+    List<RetrievedChunk> chunks,
+    String promptPreview,
+    long latencyMs
+) {}
+```
+
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/DebugRequest.java`
+
+```java
+package com.example.knowledge_rag.dto;
+
+public record DebugRequest(String question, Integer topK) {}
+```
+
+后端调试接口加到 `DebugController`：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/DebugController.java`（追加）
 
 ```java
 @PostMapping("/debug/retrieval")
@@ -1333,7 +1633,7 @@ public RetrievalDebugResult debugRetrieval(@RequestBody DebugRequest req) {
 }
 ```
 
-前端 `/debug` 页面展示：
+📄 `frontend/src/app/debug/page.tsx` — 前端调试面板展示：
 
 | 展示内容 | 说明 |
 |---|---|
@@ -1394,9 +1694,22 @@ public String rewriteQuery(String original) {
 
 ### Day 1-2：会话历史持久化
 
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/Conversation.java`
+
 ```java
+package com.example.knowledge_rag.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
+
 @Entity
 @Table(name = "conversations")
+@Data
+@NoArgsConstructor
 public class Conversation {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     private String id;
@@ -1404,9 +1717,24 @@ public class Conversation {
     @CreationTimestamp
     private LocalDateTime createdAt;
 }
+```
+
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/Message.java`
+
+```java
+package com.example.knowledge_rag.entity;
+
+import jakarta.persistence.*;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.time.LocalDateTime;
 
 @Entity
 @Table(name = "messages")
+@Data
+@NoArgsConstructor
 public class Message {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     private String id;
@@ -1428,13 +1756,31 @@ public class Message {
 }
 ```
 
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/MessageRole.java`
+
+```java
+package com.example.knowledge_rag.entity;
+
+public enum MessageRole { USER, ASSISTANT }
+```
+
 每次 RAG 回答完成后保存消息，前端加左侧对话列表（类 ChatGPT 布局）。
 
 ---
 
 ### Day 3：反馈系统（点赞 / 点踩）
 
-给 `Message` 加字段：
+给 `Message` 加字段，同时新建 `FeedbackType` 枚举：
+
+📄 `backend/src/main/java/com/example/knowledge_rag/entity/FeedbackType.java`
+
+```java
+package com.example.knowledge_rag.entity;
+
+public enum FeedbackType { LIKED, DISLIKED }
+```
+
+`Message.java` 追加：
 
 ```java
 @Enumerated(EnumType.STRING)
@@ -1444,7 +1790,17 @@ private FeedbackType feedback;  // LIKED / DISLIKED / null
 private String feedbackComment;
 ```
 
-接口：
+📄 `backend/src/main/java/com/example/knowledge_rag/dto/FeedbackRequest.java`
+
+```java
+package com.example.knowledge_rag.dto;
+
+import com.example.knowledge_rag.entity.FeedbackType;
+
+public record FeedbackRequest(FeedbackType type, String comment) {}
+```
+
+接口加到 `RagController`（或单独 `MessageController`）：
 
 ```java
 @PutMapping("/messages/{id}/feedback")
