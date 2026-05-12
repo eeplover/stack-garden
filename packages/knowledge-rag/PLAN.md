@@ -91,7 +91,7 @@ services:
       POSTGRES_USER: dev
       POSTGRES_PASSWORD: devpassword
     ports:
-      - "5432:5432"
+      - "5433:5432"   # 宿主机用 5433，避开 macOS 上 Homebrew/Postgres.app 占用的本地 5432
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -109,6 +109,16 @@ volumes:
 ```bash
 docker-compose up -d
 docker-compose ps    # postgres 和 redis 均为 Up (healthy)
+
+# 验证 1：dev 角色已创建（POSTGRES_USER 只在卷为空时才生效，
+# 如果你之前用同名卷跑过其它 Postgres 镜像，需先 down -v 再 up -d）
+docker-compose exec postgres psql -U dev -d knowledge_rag -c '\conninfo'
+# 期望：You are connected to database "knowledge_rag" as user "dev" ...
+
+# 验证 2：从宿主机用 5433 端口能连进去（确认没被本地 Postgres 抢路由）
+psql 'postgresql://dev:devpassword@localhost:5433/knowledge_rag' -c 'select 1;'
+# 若报 "role \"dev\" does not exist"：你大概率连到了本地 Postgres，
+# 检查 lsof -nP -iTCP:5432,5433 -sTCP:LISTEN 确认绑定情况。
 ```
 
 **4. 创建 Spring Boot 项目**
@@ -153,11 +163,11 @@ docker-compose ps    # postgres 和 redis 均为 Up (healthy)
 ```xml
 <dependency>
   <groupId>org.springframework.ai</groupId>
-  <artifactId>spring-ai-openai-spring-boot-starter</artifactId>
+  <artifactId>spring-ai-starter-model-openai</artifactId>
 </dependency>
 <dependency>
   <groupId>org.springframework.ai</groupId>
-  <artifactId>spring-ai-pgvector-store-spring-boot-starter</artifactId>
+  <artifactId>spring-ai-starter-vector-store-pgvector</artifactId>
 </dependency>
 <dependency>
   <groupId>org.springframework.ai</groupId>
@@ -174,7 +184,7 @@ spring:
   application:
     name: knowledge-rag
   datasource:
-    url: jdbc:postgresql://localhost:5432/knowledge_rag
+    url: jdbc:postgresql://localhost:5433/knowledge_rag
     username: dev
     password: devpassword
   jpa:
