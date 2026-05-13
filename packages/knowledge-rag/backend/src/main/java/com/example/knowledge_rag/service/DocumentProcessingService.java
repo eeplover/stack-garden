@@ -144,7 +144,7 @@ public class DocumentProcessingService {
             var chunk = new DocumentChunk();
             chunk.setDocumentId(documentId);
             chunk.setChunkIndex(i);
-            chunk.setContent(chunks.get(i).getContent());
+            chunk.setContent(chunks.get(i).getText());
             chunkRepository.save(chunk);
         }
     }

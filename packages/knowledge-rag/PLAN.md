@@ -1015,11 +1015,242 @@ public class DocumentProcessingService {
 
 ### Day 6-7：前端文档管理页
 
-📄 `frontend/src/app/documents/page.tsx`，实现：
-- 拖拽或点击上传区域
-- 文档列表，含状态徽章（待处理 / 处理中 / 已完成 / 失败）
-- 每 3 秒轮询更新状态（`setInterval` + fetch）
-- 文件大小格式化显示
+**学习重点：** Next.js App Router 路由约定、React 拖拽事件、轮询刷新、FormData 文件上传
+
+---
+
+**1. 后端：文档 CRUD API**
+
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/DocumentController.java`
+
+```java
+package com.example.knowledge_rag.controller;
+
+import com.example.knowledge_rag.dto.DocumentResponse;
+import com.example.knowledge_rag.repository.DocumentRepository;
+import com.example.knowledge_rag.service.DocumentService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/documents")
+@CrossOrigin(origins = "http://localhost:3000")
+@RequiredArgsConstructor
+public class DocumentController {
+
+    private final DocumentService documentService;
+    private final DocumentRepository documentRepository;
+
+    // 上传文件，异步触发向量化处理
+    @PostMapping
+    public ResponseEntity<DocumentResponse> upload(@RequestParam("file") MultipartFile file) {
+        var saved = documentService.upload(file);
+        return ResponseEntity.ok(DocumentResponse.from(saved));
+    }
+
+    // 查询所有文档，按上传时间倒序返回
+    @GetMapping
+    public List<DocumentResponse> list() {
+        return documentRepository.findAllByOrderByCreatedAtDesc()
+                .stream()
+                .map(DocumentResponse::from)
+                .toList();
+    }
+}
+```
+
+---
+
+**2. 前端：文档管理页**
+
+📄 `frontend/src/app/documents/page.tsx`
+
+```typescript
+'use client';
+
+import { useCallback, useEffect, useRef, useState } from 'react';
+
+interface DocumentItem {
+  id: string;
+  originalFilename: string;
+  status: 'PENDING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
+  fileSize: number;
+  chunkCount: number | null;
+  createdAt: string;
+}
+
+// 文件大小格式化：自动选择 B / KB / MB
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const STATUS_LABEL: Record<DocumentItem['status'], string> = {
+  PENDING: '待处理',
+  PROCESSING: '处理中',
+  COMPLETED: '已完成',
+  FAILED: '失败',
+};
+
+const STATUS_CLASS: Record<DocumentItem['status'], string> = {
+  PENDING: 'bg-yellow-100 text-yellow-700',
+  PROCESSING: 'bg-blue-100 text-blue-700',
+  COMPLETED: 'bg-green-100 text-green-700',
+  FAILED: 'bg-red-100 text-red-700',
+};
+
+export default function DocumentsPage() {
+  const [docs, setDocs] = useState<DocumentItem[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // 拉取文档列表，轮询失败静默忽略
+  const fetchDocs = useCallback(async () => {
+    try {
+      const res = await fetch('http://localhost:8080/api/documents');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setDocs(await res.json());
+    } catch {
+      // 轮询失败静默忽略，避免频繁弹错
+    }
+  }, []);
+
+  // 首次加载 + 每 3 秒轮询，组件卸载时清除定时器
+  useEffect(() => {
+    fetchDocs();
+    const timer = setInterval(fetchDocs, 3000);
+    return () => clearInterval(timer);
+  }, [fetchDocs]);
+
+  async function uploadFile(file: File) {
+    setUploading(true);
+    setError(null);
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch('http://localhost:8080/api/documents', {
+        method: 'POST',
+        body: form,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      await fetchDocs(); // 上传后立即刷新列表
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '上传失败');
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (file) uploadFile(file);
+    e.target.value = ''; // 重置，允许重复选同一文件
+  }
+
+  function onDragOver(e: React.DragEvent) {
+    e.preventDefault();
+    setDragging(true);
+  }
+
+  function onDragLeave() {
+    setDragging(false);
+  }
+
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    setDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) uploadFile(file);
+  }
+
+  return (
+    <main className="max-w-3xl mx-auto p-6 space-y-6">
+      <h1 className="text-2xl font-bold">文档管理</h1>
+
+      {/* 上传区域：支持拖拽和点击选择 */}
+      <div
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+        onClick={() => inputRef.current?.click()}
+        className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-colors
+          ${dragging ? 'border-blue-500 bg-blue-50' : 'border-gray-300 hover:border-blue-400 hover:bg-gray-50'}
+          ${uploading ? 'opacity-50 pointer-events-none' : ''}`}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".pdf,.txt,.md,.doc,.docx"
+          className="hidden"
+          onChange={onFileChange}
+        />
+        <p className="text-4xl mb-2">📄</p>
+        {uploading ? (
+          <p className="text-gray-500">上传中…</p>
+        ) : (
+          <>
+            <p className="text-gray-700 font-medium">拖拽文件到此处，或点击选择</p>
+            <p className="text-sm text-gray-400 mt-1">支持 PDF、TXT、Markdown、Word</p>
+          </>
+        )}
+      </div>
+
+      {/* 错误提示 */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-sm">
+          {error}
+        </div>
+      )}
+
+      {/* 文档列表 */}
+      {docs.length === 0 ? (
+        <p className="text-gray-400 text-center py-10">暂无文档，请先上传</p>
+      ) : (
+        <div className="space-y-2">
+          {docs.map((doc) => (
+            <div
+              key={doc.id}
+              className="flex items-center justify-between bg-white border border-gray-200 rounded-lg px-4 py-3 shadow-sm"
+            >
+              <div className="min-w-0 flex-1 pr-4">
+                <p className="font-medium truncate">{doc.originalFilename}</p>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {formatFileSize(doc.fileSize)}
+                  {doc.chunkCount != null && ` · ${doc.chunkCount} 个分块`}
+                  {' · '}
+                  {new Date(doc.createdAt).toLocaleString('zh-CN')}
+                </p>
+              </div>
+
+              {/* 状态徽章，PROCESSING 附带旋转动画 */}
+              <span
+                className={`shrink-0 text-xs font-semibold px-2.5 py-1 rounded-full ${STATUS_CLASS[doc.status]}`}
+              >
+                {doc.status === 'PROCESSING' && (
+                  <span className="mr-1 inline-block animate-spin">⟳</span>
+                )}
+                {STATUS_LABEL[doc.status]}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </main>
+  );
+}
+```
+
+访问 `http://localhost:3000/documents` 即可使用文档管理页。
 
 **验收：**
 - [ ] 上传 PDF 成功，数据库有记录
@@ -1392,6 +1623,7 @@ import com.example.knowledge_rag.dto.RagRequest;
 import com.example.knowledge_rag.dto.RetrievedChunk;
 import com.example.knowledge_rag.service.RagService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
@@ -1440,7 +1672,175 @@ public class RagController {
 }
 ```
 
-📄 `frontend/src/app/rag/page.tsx` — 先展示 sources，再流式展示回答（调用 `/api/rag/sources` 后调 `/api/rag/stream`，参考 `page.tsx` 的 `sendMessage` 模式实现）。
+📄 `frontend/src/app/rag/page.tsx`
+
+**交互流程：**
+1. 提交问题 → 调 `POST /api/rag/sources` 取引用 chunks（同步）
+2. 用 SSE 读取 `POST /api/rag/stream`，流式拼接回答文本
+3. 先展示引用来源，再逐 token 呈现答案
+
+```typescript
+'use client';
+
+import { type FormEvent, useRef, useState } from 'react';
+
+// ─── 类型 ────────────────────────────────────────────────────────────────────
+
+interface RetrievedChunk {
+  id: string;
+  content: string;
+  documentId: string;
+  score: number; // 余弦距离，越小越相关
+}
+
+// ─── 组件 ────────────────────────────────────────────────────────────────────
+
+export default function RagPage() {
+  const [input, setInput] = useState('');
+  const [sources, setSources] = useState<RetrievedChunk[]>([]);
+  const [answer, setAnswer] = useState('');
+  const [busy, setBusy] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+
+  async function onSubmit(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const question = input.trim();
+    if (!question || busy) return;
+
+    // 取消上一次未完成的流
+    abortRef.current?.abort();
+    abortRef.current = new AbortController();
+
+    setBusy(true);
+    setSources([]);
+    setAnswer('');
+
+    try {
+      // ── Step 1：同步获取引用 chunks ───────────────────────────────────────
+      const srcRes = await fetch('http://localhost:8080/api/rag/sources', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+        signal: abortRef.current.signal,
+      });
+      if (!srcRes.ok) throw new Error(`sources failed: ${srcRes.status}`);
+      const chunks: RetrievedChunk[] = await srcRes.json();
+      setSources(chunks);
+
+      // ── Step 2：SSE 流式读取回答 ───────────────────────────────────────────
+      const streamRes = await fetch('http://localhost:8080/api/rag/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question }),
+        signal: abortRef.current.signal,
+      });
+      if (!streamRes.ok || !streamRes.body) throw new Error(`stream failed: ${streamRes.status}`);
+
+      const reader = streamRes.body.getReader();
+      const decoder = new TextDecoder();
+      let sseBuffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        sseBuffer += decoder.decode(value, { stream: true });
+
+        let newlineIndex: number;
+        while ((newlineIndex = sseBuffer.indexOf('\n')) >= 0) {
+          const line = sseBuffer.slice(0, newlineIndex).trimEnd();
+          sseBuffer = sseBuffer.slice(newlineIndex + 1);
+          if (line.startsWith('data: ')) {
+            const token = line.slice(6).trim();
+            if (token && token !== '[DONE]') {
+              // 用函数式更新确保多次 setState 不会丢 token
+              setAnswer((prev) => prev + token);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        setAnswer((prev) => prev + '\n\n[请求出错：' + err.message + ']');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="flex flex-col max-w-3xl mx-auto h-screen p-4">
+      <h1 className="text-2xl font-bold mb-4">知识库 RAG 问答</h1>
+
+      {/* 问题输入 */}
+      <form onSubmit={onSubmit} className="flex gap-2 mb-4">
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="输入问题，将基于已上传文档回答…"
+          className="flex-1 border border-gray-300 rounded-lg p-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
+        />
+        <button
+          type="submit"
+          disabled={busy || !input.trim()}
+          className="bg-blue-500 text-white px-6 py-3 rounded-lg disabled:opacity-50"
+        >
+          {busy ? '检索中…' : '提问'}
+        </button>
+      </form>
+
+      <div className="flex-1 overflow-y-auto space-y-4">
+        {/* 引用来源 */}
+        {sources.length > 0 && (
+          <section>
+            <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-2">
+              引用来源（{sources.length} 个 chunk）
+            </h2>
+            <div className="space-y-2">
+              {sources.map((chunk, i) => (
+                <div
+                  key={chunk.id}
+                  className="border border-gray-200 rounded-lg p-3 bg-gray-50 text-sm"
+                >
+                  <div className="flex justify-between text-xs text-gray-400 mb-1">
+                    <span>#{i + 1} · 文档 {chunk.documentId.slice(0, 8)}…</span>
+                    {/* 相似度：距离越小越好，转为 0-100% 方便直觉判断 */}
+                    <span>相似度 {Math.round((1 - chunk.score / 2) * 100)}%</span>
+                  </div>
+                  <p className="text-gray-700 line-clamp-3">{chunk.content}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* 流式回答 */}
+        {(answer || busy) && (
+          <section>
+            <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-2">
+              回答
+            </h2>
+            <div className="bg-white border border-gray-200 rounded-lg p-4 whitespace-pre-wrap text-gray-800">
+              {answer}
+              {/* 光标闪烁，表示仍在流式输出 */}
+              {busy && <span className="animate-pulse">▋</span>}
+            </div>
+          </section>
+        )}
+
+        {/* 无结果提示 */}
+        {!busy && sources.length === 0 && answer === '' && (
+          <p className="text-gray-400 text-center pt-16">
+            提交问题后，这里将展示检索到的引用和 AI 回答
+          </p>
+        )}
+      </div>
+    </main>
+  );
+}
+```
+
+访问 `http://localhost:3000/rag` 即可使用 RAG 问答页。
 
 ---
 
@@ -1766,6 +2166,111 @@ public enum MessageRole { USER, ASSISTANT }
 
 每次 RAG 回答完成后保存消息，前端加左侧对话列表（类 ChatGPT 布局）。
 
+**后端：ConversationRepository + ConversationController**
+
+📄 `backend/.../repository/ConversationRepository.java`
+
+```java
+package com.example.knowledge_rag.repository;
+
+import com.example.knowledge_rag.entity.Conversation;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.List;
+
+@Repository
+public interface ConversationRepository extends JpaRepository<Conversation, String> {
+    List<Conversation> findAllByOrderByCreatedAtDesc();
+}
+```
+
+📄 `backend/.../controller/ConversationController.java`
+
+```java
+package com.example.knowledge_rag.controller;
+
+import com.example.knowledge_rag.entity.Conversation;
+import com.example.knowledge_rag.repository.ConversationRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/conversations")
+@CrossOrigin(origins = "http://localhost:3000")
+@RequiredArgsConstructor
+public class ConversationController {
+
+    private final ConversationRepository conversationRepository;
+
+    @GetMapping
+    public List<Conversation> list() {
+        return conversationRepository.findAllByOrderByCreatedAtDesc();
+    }
+
+    @PostMapping
+    public ResponseEntity<Conversation> create(@RequestBody Map<String, String> body) {
+        var conv = new Conversation();
+        conv.setTitle(body.getOrDefault("title", "新对话"));
+        return ResponseEntity.ok(conversationRepository.save(conv));
+    }
+}
+```
+
+**后端：MessageController 补充保存端点**
+
+📄 `backend/.../dto/SaveMessageRequest.java`
+
+```java
+package com.example.knowledge_rag.dto;
+
+import com.example.knowledge_rag.entity.MessageRole;
+
+public record SaveMessageRequest(MessageRole role, String content, String sources) {}
+```
+
+在 `MessageController` 中追加：
+
+```java
+// 前端流式回答结束后，将用户消息和助手消息分两次 POST 保存到数据库。
+@PostMapping("/conversations/{conversationId}/messages")
+public ResponseEntity<Message> saveMessage(
+        @PathVariable String conversationId,
+        @RequestBody SaveMessageRequest req) {
+    return ResponseEntity.ok(
+            messageService.save(conversationId, req.role(), req.content(), req.sources()));
+}
+```
+
+**前端：类 ChatGPT 双列布局**
+
+📄 `frontend/src/app/rag/page.tsx`（完整重构，主要结构如下）
+
+```
+┌─── 左栏（w-60，深色）────────────┬─── 右栏 ─────────────────────────────┐
+│ [＋ 新建对话]                     │  消息列表（可滚动）                    │
+│ > 当前对话标题                    │    [用户气泡]                          │
+│   历史对话 1                      │    [引用来源（可折叠）]                 │
+│   历史对话 2                      │    [AI 回答气泡]  [👍][👎]             │
+│   …                               │    [流式输出中（附光标）]              │
+│                                   ├──────────────────────────────────────┤
+│                                   │  [输入框]                   [发送]    │
+└───────────────────────────────────┴──────────────────────────────────────┘
+```
+
+**交互流程：**
+1. 挂载时 `GET /api/conversations` 加载左栏列表
+2. 点击对话 → `GET /api/conversations/{id}/messages` 加载历史
+3. 点"新建对话"→ 重置右栏，下次提问时自动创建
+4. 提交问题 →
+   - 若无当前对话，先 `POST /api/conversations` 建一条（title 取问题前 30 字）
+   - `POST /api/rag/sources` 同步获取引用
+   - `POST /api/rag/stream` 流式读取回答
+   - 流结束后 `POST /api/conversations/{id}/messages` 分两次保存 USER / ASSISTANT 消息
+5. 点 👍/👎 → `PUT /api/messages/{id}/feedback`，乐观更新本地状态
+
 ---
 
 ### Day 3：反馈系统（点赞 / 点踩）
@@ -1800,13 +2305,127 @@ import com.example.knowledge_rag.entity.FeedbackType;
 public record FeedbackRequest(FeedbackType type, String comment) {}
 ```
 
-接口加到 `RagController`（或单独 `MessageController`）：
+**1. Repository**
+
+📄 `backend/src/main/java/com/example/knowledge_rag/repository/MessageRepository.java`
 
 ```java
-@PutMapping("/messages/{id}/feedback")
-public void feedback(@PathVariable String id, @RequestBody FeedbackRequest req) {
-    messageService.updateFeedback(id, req.type(), req.comment());
+package com.example.knowledge_rag.repository;
+
+import com.example.knowledge_rag.entity.Message;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+
+@Repository
+public interface MessageRepository extends JpaRepository<Message, String> {
+    // 按会话 ID 查历史消息，按时间正序（便于前端按顺序渲染对话）
+    List<Message> findByConversationIdOrderByCreatedAtAsc(String conversationId);
 }
+```
+
+**2. Service**
+
+📄 `backend/src/main/java/com/example/knowledge_rag/service/MessageService.java`
+
+```java
+package com.example.knowledge_rag.service;
+
+import com.example.knowledge_rag.entity.FeedbackType;
+import com.example.knowledge_rag.entity.Message;
+import com.example.knowledge_rag.entity.MessageRole;
+import com.example.knowledge_rag.repository.MessageRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+public class MessageService {
+
+    private final MessageRepository messageRepository;
+
+    /** 保存一条消息（USER 或 ASSISTANT），返回带 id / createdAt 的完整记录。 */
+    public Message save(String conversationId, MessageRole role,
+                        String content, String sourcesJson) {
+        var msg = new Message();
+        msg.setConversationId(conversationId);
+        msg.setRole(role);
+        msg.setContent(content);
+        msg.setSources(sourcesJson);
+        return messageRepository.save(msg);
+    }
+
+    /** 查询某会话的全部历史消息，按创建时间升序。 */
+    public List<Message> listByConversation(String conversationId) {
+        return messageRepository.findByConversationIdOrderByCreatedAtAsc(conversationId);
+    }
+
+    /**
+     * 更新用户对某条消息的反馈（点赞 / 点踩 + 可选评论）。
+     * 消息不存在时抛出 IllegalArgumentException，由全局异常处理器返回 404。
+     */
+    public void updateFeedback(String messageId, FeedbackType type, String comment) {
+        var msg = messageRepository.findById(messageId)
+                .orElseThrow(() -> new IllegalArgumentException("Message not found: " + messageId));
+        msg.setFeedback(type);
+        msg.setFeedbackComment(comment);
+        messageRepository.save(msg);
+    }
+}
+```
+
+**3. Controller**
+
+📄 `backend/src/main/java/com/example/knowledge_rag/controller/MessageController.java`
+
+```java
+package com.example.knowledge_rag.controller;
+
+import com.example.knowledge_rag.dto.FeedbackRequest;
+import com.example.knowledge_rag.entity.Message;
+import com.example.knowledge_rag.service.MessageService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+
+@RestController
+@RequestMapping("/api")
+@CrossOrigin(origins = "http://localhost:3000")
+@RequiredArgsConstructor
+public class MessageController {
+
+    private final MessageService messageService;
+
+    /** 查询会话历史：前端对话列表初始化时调用。 */
+    @GetMapping("/conversations/{conversationId}/messages")
+    public List<Message> listMessages(@PathVariable String conversationId) {
+        return messageService.listByConversation(conversationId);
+    }
+
+    /**
+     * 点赞 / 点踩接口。
+     * PUT 语义：对已有资源做部分更新，比 PATCH 更常见于简单字段覆盖场景。
+     */
+    @PutMapping("/messages/{id}/feedback")
+    public void feedback(@PathVariable String id, @RequestBody FeedbackRequest req) {
+        messageService.updateFeedback(id, req.type(), req.comment());
+    }
+}
+```
+
+验收：
+```bash
+# 查询某会话消息（先有对话记录）
+curl http://localhost:8080/api/conversations/<conversationId>/messages
+
+# 点赞某条消息
+curl -X PUT http://localhost:8080/api/messages/<messageId>/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"type":"LIKED","comment":"很有帮助"}'
 ```
 
 ---

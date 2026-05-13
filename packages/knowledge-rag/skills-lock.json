@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "idealab-cc-switch-usage": {
+      "source": "10xagent/skills",
+      "sourceType": "git",
+      "skillPath": "idealab-cc-switch-usage/SKILL.md",
+      "computedHash": "738253d8038c392a563ae6e6ac69e153065486aa7da010a19e98f07010e085a1"
+    }
+  }
+}
